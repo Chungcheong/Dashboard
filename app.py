@@ -5,6 +5,8 @@ import plotly.express as px
 import base64
 import re
 import streamlit.components.v1 as components
+from io import BytesIO, StringIO
+import zipfile
 
 st.set_page_config(page_title="업무일지 분석 대시보드", layout="wide")
 
@@ -29,11 +31,25 @@ def split_workers(worker_string):
 
 
 def process_data(uploaded_file):
-    df_original = pd.read_csv(uploaded_file)
+    # CSV 읽기: 날짜 컬럼 즉시 파싱 + 인코딩 폴백
+    try:
+        df_original = pd.read_csv(
+            uploaded_file,
+            parse_dates=['시작일시','종료일시'],
+            dayfirst=False
+        )
+    except UnicodeDecodeError:
+        uploaded_file.seek(0)
+        df_original = pd.read_csv(
+            uploaded_file,
+            parse_dates=['시작일시','종료일시'],
+            dayfirst=False,
+            encoding='cp949'
+        )
+
+    # 데이터 가공
     df = df_original.copy()
     df['원본작업자'] = df['작업자']
-    df['시작일시'] = pd.to_datetime(df['시작일시'])
-    df['종료일시'] = pd.to_datetime(df['종료일시'])
     df['작업시간(분)'] = (df['종료일시'] - df['시작일시']).dt.total_seconds() / 60
     # ✅ 동일 작업자 + 동일 시간대 중복 제거
     df = df.drop_duplicates(subset=['작업자', '시작일시', '종료일시'])
@@ -42,28 +58,51 @@ def process_data(uploaded_file):
     df = df.explode('작업자목록')
     df['작업자'] = df['작업자목록'].astype(str).str.strip()
     df.drop(columns=['작업자목록'], inplace=True)
+
+    # 월 내 단순 주차(정책에 따라 조정 가능)
     df['주차'] = df['시작일시'].apply(lambda x: f"{x.month}월{x.day // 7 + 1}주")
-    df['작업일'] = pd.to_datetime(df['시작일시'].dt.date)
+    # ISO 주차도 함께 생성(사이드바에서 선택 적용)
+    df['ISO주차'] = df['시작일시'].dt.strftime('%G-W%V')
+
+    # 날짜 타입 통일: datetime64[ns]로 보정해 병합 오류 방지
+    df['작업일'] = df['시작일시'].dt.normalize()
     return df, df_original
 
 
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8-sig')
 
+# 📦 멀티시트 엑셀 변환
+def to_excel(sheets: dict):
+    """멀티시트 XLSX 생성. 엔진 미설치 시 ZIP(CSV 묶음)으로 폴백.
+    Returns: (bytes, fmt) where fmt in {"xlsx", "zip"}
+    """
+    # 1) 가능한 엑셀 엔진 시도(openpyxl → xlsxwriter)
+    for engine in ("openpyxl", "xlsxwriter"):
+        try:
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine=engine) as writer:
+                for name, d in sheets.items():
+                    if hasattr(d, 'data'):
+                        d = d.data
+                    d.to_excel(writer, index=False, sheet_name=name[:31])
+            return output.getvalue(), "xlsx"
+        except ModuleNotFoundError:
+            continue
+        except Exception:
+            # 다른 예외는 다음 옵션으로 폴백
+            continue
 
-# ✅ HSL → HEX 변환 유틸 (matplotlib 제거용)
-def hsl_to_hex(h, s, l):
-    c = (1 - abs(2*l - 1)) * s
-    x = c * (1 - abs((h/60) % 2 - 1))
-    m = l - c/2
-    if   0 <= h < 60:   r1, g1, b1 = c, x, 0
-    elif 60 <= h < 120: r1, g1, b1 = x, c, 0
-    elif 120 <= h < 180:r1, g1, b1 = 0, c, x
-    elif 180 <= h < 240:r1, g1, b1 = 0, x, c
-    elif 240 <= h < 300:r1, g1, b1 = x, 0, c
-    else:               r1, g1, b1 = c, 0, x
-    r, g, b = int((r1 + m) * 255), int((g1 + m) * 255), int((b1 + m) * 255)
-    return f'#{r:02x}{g:02x}{b:02x}'
+    # 2) 엑셀 엔진이 없으면 ZIP으로 CSV 묶음 제공
+    zbuf = BytesIO()
+    with zipfile.ZipFile(zbuf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, d in sheets.items():
+            if hasattr(d, 'data'):
+                d = d.data
+            safe = f"{name[:31]}.csv"
+            zf.writestr(safe, d.to_csv(index=False, encoding='utf-8-sig'))
+    return zbuf.getvalue(), "zip"
+
 
 
 def main():
@@ -74,17 +113,19 @@ def main():
 """, unsafe_allow_html=True)
     with col2:
         logo_base64 = st.session_state.get('logo_base64', "")
-        st.markdown(f"""
-        <div style='display: flex; justify-content: flex-end;'>
-            <img src='data:image/jpeg;base64,{logo_base64}' width='180'>
-        </div>
-        """, unsafe_allow_html=True)
+        if logo_base64:
+            st.markdown(f"""
+            <div style='display: flex; justify-content: flex-end;'>
+                <img src='data:image/jpeg;base64,{logo_base64}' width='180'>
+            </div>
+            """, unsafe_allow_html=True)
 
     st.markdown("""
 <p style='font-size: 25px;'>업무일지를 업로드하고, 팀과 팀원별로 분석 결과를 확인하세요.</p>
 """, unsafe_allow_html=True)
 
     uploaded_file = st.file_uploader("📁 work_report.csv 파일 업로드", type=["csv"])
+    st.caption("필수 컬럼: 팀, 작업자, 시작일시, 종료일시, 업무종류, 구분, 장비ID, 장비명")
     st.markdown("""
 <div style='padding: 12px; background-color: #f0f8ff; border-left: 5px solid #0072C6; font-weight: bold; font-size: 16px;'>
 📤 MOStagram에서 업무일지 데이터 파일을 <b>다운로드한 후</b>, 해당 파일을 
@@ -93,26 +134,83 @@ def main():
 </div>
 """, unsafe_allow_html=True)
 
-    if uploaded_file:
-        # ✅ 컬럼 존재 검증(업로드 직후)
-        cols_df = pd.read_csv(uploaded_file, nrows=0)
-        required_cols = ['팀','작업자','시작일시','종료일시','업무종류','구분','장비ID','장비명']
-        missing = [c for c in required_cols if c not in cols_df.columns]
-        if missing:
-            st.error(f"필수 컬럼 누락: {missing} — CSV 컬럼명을 확인해주세요.")
-            st.stop()
-        uploaded_file.seek(0)
+    # 🧰 샘플 데이터 사용 (파일이 없을 때 UI 체험용)
+    with st.expander("🧰 샘플 데이터 사용", expanded=False):
+        if st.button("샘플 CSV 불러오기"):
+            sample = pd.DataFrame({
+                '팀': ['A','A','B','B'],
+                '작업자': ['홍길동','김철수','이영희','박영수'],
+                '시작일시': pd.to_datetime(['2025-08-10 09:00','2025-08-10 10:00','2025-08-11 09:30','2025-08-11 11:00']),
+                '종료일시': pd.to_datetime(['2025-08-10 12:00','2025-08-10 15:00','2025-08-11 13:00','2025-08-11 14:30']),
+                '업무종류': ['무선','무선','유선','무선'],
+                '구분': ['장애/알람(AS)','사무업무','장애/알람(AS)','장애/알람(AS)'],
+                '장비ID': ['E1','E2','E3','E3'],
+                '장비명': ['국소1','국소2','국소3','국소3'],
+            })
+            st.session_state['sample_df'] = sample
+            st.success("샘플 데이터가 로드되었습니다. 아래 분석을 확인해보세요.")
 
-        # ✅ 데이터 가공
-        df, _ = process_data(uploaded_file)
+    if uploaded_file or st.session_state.get('sample_df') is not None:
+        # 업로드/샘플 분기
+        if uploaded_file:
+            # ✅ 컬럼 존재 검증(업로드 직후) — 인코딩 대비
+            try:
+                cols_df = pd.read_csv(uploaded_file, nrows=0)
+            except UnicodeDecodeError:
+                uploaded_file.seek(0)
+                cols_df = pd.read_csv(uploaded_file, nrows=0, encoding='cp949')
+            except Exception as e:
+                st.error(f"CSV 파일을 읽는 중 오류가 발생했습니다: {e}")
+                st.stop()
+            required_cols = ['팀','작업자','시작일시','종료일시','업무종류','구분','장비ID','장비명']
+            missing = [c for c in required_cols if c not in cols_df.columns]
+            if missing:
+                st.error(f"필수 컬럼 누락: {missing} — CSV 컬럼명을 확인해주세요.")
+                st.stop()
+            uploaded_file.seek(0)
 
+            # ✅ 데이터 가공
+            df, _ = process_data(uploaded_file)
+        else:
+            # 샘플 데이터 처리
+            sample_df = st.session_state.get('sample_df').copy()
+            _buf = StringIO()
+            sample_df.to_csv(_buf, index=False)
+            _buf.seek(0)
+            df, _ = process_data(_buf)
+
+        # 표준화(띄어쓰기/동의어 정리)
+        df['구분'] = df['구분'].astype(str).str.strip().replace({
+            '장애/알람(AS)': '장애/알람',
+            '사무업무 ': '사무업무'
+        })
+        df['팀'] = df['팀'].astype(str).str.strip()
+
+        st.success(f"업로드 완료: {len(df):,}행 로드")
+
+        
         with st.sidebar:
             st.header("🔍 검색")
             min_date = df['시작일시'].min().date()
             max_date = df['종료일시'].max().date()
             start_date, end_date = st.date_input("작업 기간 필터", [min_date, max_date], min_value=min_date, max_value=max_date)
 
+            st.subheader("⚙️ 설정")
+            week_basis = st.radio("주차 기준", ["월내 단순 주차", "ISO 주차"], horizontal=True)
+            daily_avg_threshold_hours = st.number_input("일별 평균작업시간 기준(시간)", min_value=0.0, max_value=24.0, value=6.2, step=0.1, format="%.1f")
+            util_threshold = st.number_input("가동율 기준(%)", min_value=0, max_value=100, value=68, step=1)
+
+            with st.expander("🔁 중복 출동 기준", expanded=False):
+                dup_threshold = st.slider("최소 출동 횟수(건)", 2, 10, 3, 1)
+
+            # 필터 초기화
+            if st.button("필터 초기화"):
+                st.experimental_rerun()
+
         df = df[(df['시작일시'].dt.date >= start_date) & (df['종료일시'].dt.date <= end_date)]
+
+        # 주차 표기 기준 적용
+        df['주차_표시'] = df['ISO주차'] if week_basis == "ISO 주차" else df['주차']
 
         if '팀' in df.columns:
             team_options = df['팀'].dropna().unique().tolist()
@@ -135,6 +233,17 @@ def main():
                     default=member_options
                 )
             df = df[df['작업자'].isin(selected_members)]
+            st.session_state['selected_team'] = selected_team
+            st.session_state['selected_members'] = selected_members
+
+        # 🔎 텍스트 검색 필터 (장비명/작업자)
+        with st.sidebar.expander("🔎 텍스트 검색", expanded=False):
+            q = st.text_input("장비명/작업자 검색(부분일치)")
+        if q:
+            df = df[
+                df['장비명'].astype(str).str.contains(q, na=False) |
+                df['작업자'].astype(str).str.contains(q, na=False)
+            ]
         # 데이터 없음 방지
         if df.empty:
             st.warning("선택한 조건에 해당하는 데이터가 없습니다. 필터를 조정해 주세요.")
@@ -156,7 +265,7 @@ def main():
         st.markdown("## 🔁 중복 출동 현황")
         dup_equipment = df[
             (df['업무종류'] == '무선') &
-            (df['구분'] == '장애/알람(AS)') &
+            (df['구분'] == '장애/알람') &
             df['장비ID'].notna() &
             (df['장비ID'].astype(str).str.strip() != '') &
             df['장비명'].notna() &
@@ -166,7 +275,7 @@ def main():
         ]
 
         duplicated_ids = dup_equipment['장비ID'].value_counts()
-        duplicated_ids = duplicated_ids[duplicated_ids >= 3].index
+        duplicated_ids = duplicated_ids[duplicated_ids >= dup_threshold].index
         dup_equipment = dup_equipment[dup_equipment['장비ID'].isin(duplicated_ids)]
 
         grouped = dup_equipment.groupby(['팀', '장비명', '장비ID', '작업자']).size().reset_index(name='건수')
@@ -179,9 +288,11 @@ def main():
         중복건수_df = 중복건수_df.groupby(['팀', '장비명', '장비ID']).size().reset_index(name='중복건수')
 
         combined = combined.merge(중복건수_df, on=['팀', '장비명', '장비ID'], how='left')
-        combined = combined[combined['중복건수'] >= 3]
+        combined = combined[combined['중복건수'] >= dup_threshold]
         dup_equipment_sorted = combined.sort_values(by='중복건수', ascending=False).reset_index(drop=True)
-        st.dataframe(dup_equipment_sorted.rename(columns={'팀': '운용팀'}), use_container_width=True)
+        dup_display = dup_equipment_sorted.rename(columns={'팀': '운용팀'})
+        st.dataframe(dup_display, use_container_width=True)
+        st.download_button("⬇️ 중복 출동 현황 CSV", data=convert_df_to_csv(dup_display), file_name="중복출동현황.csv", mime="text/csv")
 
         # ─────────────────────────────────────────────────────────
         # 👤 개인별 누락 현황  (다음 표시)
@@ -222,9 +333,9 @@ def main():
 
         personal_summary = personal_summary.sort_values('누락일수', ascending=False).head(30)
         personal_summary.reset_index(drop=True, inplace=True)
-        styled_df = personal_summary[['팀', '작업자', '누락일수', '누락률(%)']]
-        styled_df['누락일수'] = styled_df['누락일수'].astype(int)
-        styled_df['누락률(%)'] = styled_df['누락률(%)'].astype(int)
+        styled_df = personal_summary[['팀', '작업자', '누락일수', '누락률(%)']].copy()
+        styled_df.loc[:, '누락일수'] = styled_df['누락일수'].astype(int)
+        styled_df.loc[:, '누락률(%)'] = styled_df['누락률(%)'].astype(int)
 
         # ✔ 개인별 누락 현황 — 표 형식(중복 출동 현황과 동일 스타일)
         table_df = (
@@ -234,6 +345,27 @@ def main():
             .rename(columns={'팀': '운용팀'})
         )
         st.dataframe(table_df, use_container_width=True)
+        st.download_button("⬇️ 개인별 누락 현황 CSV", data=convert_df_to_csv(table_df), file_name="개인별누락현황.csv", mime="text/csv")
+
+        # ❗ 데이터 품질 점검 (항상 표시)
+        st.markdown("## ❗ 작업시간 오류")
+        neg_cnt = int((df['작업시간(분)'] < 0).sum())
+        zero_cnt = int((df['작업시간(분)'] == 0).sum())
+        null_team = int(df['팀'].isna().sum())
+        st.write(f"- 음수 작업시간: **{neg_cnt}건**")
+        st.write(f"- 0분 작업시간: **{zero_cnt}건**")
+        long_cnt = int((df['작업시간(분)'] > 480).sum())
+        st.write(f"- 날짜 오류건: **{long_cnt}건**")
+        st.write(f"- 팀 결측: **{null_team}건**")
+
+        # 긴 작업시간 이상치 Top 30 (IQR 기준) — 10줄만 보이고 나머지는 스크롤
+        q1, q3 = df['작업시간(분)'].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        upper = q3 + 1.5 * iqr
+        outliers = df[df['작업시간(분)'] > upper] \
+            .sort_values('작업시간(분)', ascending=False) \
+            .head(30)[['팀','작업자','구분','장비명','작업시간(분)','시작일시','종료일시']]
+        st.dataframe(outliers, use_container_width=True, height=420)
 
         # ─────────────────────────────────────────────────────────
         # 🕒 구분별 MTTR / 반복도 (이 섹션만 이동업무 제외)
@@ -244,7 +376,8 @@ def main():
 
         # 장비ID 정리 및 음수 작업시간 제거
         mttr_df['장비ID'] = mttr_df['장비ID'].astype(str).str.strip()
-        mttr_df = mttr_df[mttr_df['작업시간(분)'] >= 0]
+        # 음수 제외 + 8시간(480분) 초과 건 제외
+        mttr_df = mttr_df[(mttr_df['작업시간(분)'] >= 0) & (mttr_df['작업시간(분)'] <= 480)]
 
         # ✅ '사무업무' 제외
         mttr_df = mttr_df[mttr_df['구분'].astype(str).str.strip() != '사무업무']
@@ -299,6 +432,7 @@ def main():
 
             fmt_all = {col: '{:.0f}' for col in result_display.columns if pd.api.types.is_numeric_dtype(result_display[col])}
             st.dataframe(result_display.style.format(fmt_all), use_container_width=True)
+            st.download_button("⬇️ MTTR/반복도 결과 CSV", data=convert_df_to_csv(result_display), file_name="MTTR_반복도_결과.csv", mime="text/csv")
 
             result_display['MTTR_label'] = result_display['MTTR(분)'].astype('Int64').astype(str)
             # ✅ 축 상한을 동적으로 맞춰 두 그래프 막대 높이가 비슷하게 보이도록 조정
@@ -349,6 +483,12 @@ def main():
                 hovertemplate='구분: %{x}<br>중복업무 비율: %{customdata[0]}%<extra></extra>'
             )
             fig_dup_ratio.update_layout(legend_title_text='구분', yaxis_range=[0, _dup_ylim], margin=dict(t=60, b=0), height=420, bargap=0.2)
+
+            # ✅ 카테고리 순서 고정(두 그래프 일관성)
+            order = result_display.sort_values('MTTR(분)')['구분'].astype(str).tolist()
+            fig_mttr.update_layout(xaxis={'categoryorder': 'array', 'categoryarray': order})
+            fig_dup_ratio.update_layout(xaxis={'categoryorder': 'array', 'categoryarray': order})
+
             cols_mttr = st.columns(2)
             with cols_mttr[0]:
                 st.plotly_chart(fig_mttr, use_container_width=True)
@@ -358,7 +498,7 @@ def main():
         # ─────────────────────────────────────────────────────────
         # 🗓️ 운용팀 일별 작성현황 (이동업무 포함)
         st.markdown("## 🗓️ 운용팀 일별 작성현황")
-        daily_count = df.groupby([pd.to_datetime(df['시작일시']).dt.date, df['팀']]).size().unstack(fill_value=0).astype(int)
+        daily_count = df.groupby([df['시작일시'].dt.date, df['팀']]).size().unstack(fill_value=0).astype(int)
         daily_count.loc['합계'] = daily_count.sum()
         st.dataframe(daily_count, use_container_width=True)
 
@@ -366,23 +506,25 @@ def main():
         # 📉 팀 주차별 가동율 (이동업무 포함)
         st.markdown("## 📉 팀 주차별 가동율")
 
-        # ✅ 1일 1인당 상한 제한 (600분)
-        capped = df.groupby(['작업일', '작업자', '팀', '주차'])['작업시간(분)'].sum().clip(upper=600).reset_index()
+        # ✅ 날짜 오류건(8시간 초과) 제외 후 집계
+        df_valid = df[(df['작업시간(분)'] >= 0) & (df['작업시간(분)'] <= 480)].copy()
+        capped = df_valid.groupby(['작업일', '작업자', '팀', '주차_표시'])['작업시간(분)'].sum().reset_index()
 
         # ✅ 팀-주차별 작업시간 및 가동율 계산
-        df_team_time = capped.groupby(['팀', '주차'])['작업시간(분)'].sum().reset_index(name='팀작업시간_분')
-        unique_worker_count = capped.groupby(['팀', '주차'])['작업자'].nunique().reset_index(name='작업자수')
-        df_weekly = df_team_time.merge(unique_worker_count, on=['팀', '주차'])
-        df_weekly['기준시간'] = df_weekly['작업자수'] * 2400
-        df_weekly['가동율(%)'] = (df_weekly['팀작업시간_분'] / df_weekly['기준시간']).clip(upper=1.0)
+        df_team_time = capped.groupby(['팀', '주차_표시'])['작업시간(분)'].sum().reset_index(name='팀작업시간_분')
+        unique_worker_count = capped.groupby(['팀', '주차_표시'])['작업자'].nunique().reset_index(name='작업자수')
+        df_weekly = df_team_time.merge(unique_worker_count, on=['팀', '주차_표시'])
+        df_weekly['기준시간'] = (df_weekly['작업자수'] * 2400).replace(0, np.nan)
+        df_weekly['가동율(%)'] = (df_weekly['팀작업시간_분'] / df_weekly['기준시간']).clip(upper=1.0).fillna(0)
 
         team_count = df['팀'].nunique()
+        base_line = util_threshold / 100.0
 
         fig_util = px.bar(
             df_weekly,
             x='팀',
             y='가동율(%)',
-            color='주차',
+            color='주차_표시',
             barmode='group',
             title='팀 주차별 가동율',
             labels={'가동율(%)': '가동율', '팀': '팀'}
@@ -393,8 +535,8 @@ def main():
             legend_title_text='주차',
             legend=dict(orientation='h', y=-0.2, x=0.5, xanchor='center')
         )
-        fig_util.add_shape(type="line", x0=-0.5, x1=team_count - 0.5, y0=0.68, y1=0.68, line=dict(color="red", width=2, dash="dot"))
-        fig_util.add_annotation(x=team_count - 0.5, y=0.68, text="기준: 68%", showarrow=False, yshift=10, font=dict(color="red"))
+        fig_util.add_shape(type="line", x0=-0.5, x1=team_count - 0.5, y0=base_line, y1=base_line, line=dict(color="red", width=2, dash="dot"))
+        fig_util.add_annotation(x=team_count - 0.5, y=base_line, text=f"기준: {util_threshold}%", showarrow=False, yshift=10, font=dict(color="red"))
         st.plotly_chart(fig_util, use_container_width=True)
 
         # ─────────────────────────────────────────────────────────
@@ -415,8 +557,9 @@ def main():
             title='일별 평균 작업시간',
             labels={'평균작업시간(시간)': '평균 작업시간(시간)', '작업일': '날짜'}
         )
+        ymax = max(10.0, float(daily_avg_threshold_hours) * 1.2)
         fig_daily.update_layout(
-            yaxis_range=[0, 10],
+            yaxis_range=[0, ymax],
             legend=dict(
                 orientation='h',
                 y=-0.25,
@@ -428,14 +571,13 @@ def main():
             type="line",
             x0=-0.5,
             x1=len(daily_avg['팀'].unique()) - 0.5,
-            y0=6.2,
-            y1=6.2,
+            y0=daily_avg_threshold_hours, y1=daily_avg_threshold_hours,
             line=dict(color="red", width=2, dash="dot")
         )
         fig_daily.add_annotation(
             x=len(daily_avg['팀'].unique()) - 0.5,
-            y=6.2,
-            text="기준: 6.2시간",
+            y=daily_avg_threshold_hours,
+            text=f"기준: {daily_avg_threshold_hours:.1f}시간",
             showarrow=False,
             yshift=10,
             font=dict(color="red")
@@ -505,6 +647,23 @@ def main():
             legend=dict(orientation='h', y=-0.2, x=0.5, xanchor='center')
         )
         st.plotly_chart(fig_crew_task, use_container_width=True)
+
+        # 📊 결과 묶음 다운로드 (XLSX 또는 ZIP 자동)
+        excel_bytes, excel_fmt = to_excel({
+            '중복출동': dup_display.reset_index(drop=True),
+            '개인별누락': table_df.reset_index(drop=True),
+            'MTTR_반복도': result_display.reset_index(drop=True),
+            '일별작성현황': daily_count.reset_index().rename(columns={'index': '작업일'})
+        })
+        if excel_fmt == "xlsx":
+            fname = "업무일지_분석_모음.xlsx"
+            mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            label = "📊 Excel(모든 시트)"
+        else:
+            fname = "업무일지_분석_모음.zip"
+            mime = "application/zip"
+            label = "📦 ZIP(모든 CSV)"
+        st.sidebar.download_button(label, data=excel_bytes, file_name=fname, mime=mime)
 
 
 if __name__ == '__main__':
