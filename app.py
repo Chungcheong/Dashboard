@@ -333,6 +333,17 @@ def main():
         combined = combined[combined['중복건수'] >= dup_threshold]
         dup_equipment_sorted = combined.sort_values(by='중복건수', ascending=False).reset_index(drop=True)
         dup_display = dup_equipment_sorted.rename(columns={'팀': '운용팀'})
+        # 📈 메트릭(중복 출동)
+        _dup_cnt = int(len(dup_equipment_sorted))
+        _dup_max = int(dup_equipment_sorted['중복건수'].max()) if not dup_equipment_sorted.empty else 0
+        try:
+            _dup_avg = float(dup_equipment_sorted['중복건수'].mean()) if not dup_equipment_sorted.empty else 0.0
+        except Exception:
+            _dup_avg = 0.0
+        m1, m2, m3 = st.columns(3)
+        m1.metric("중복 장비 수", f"{_dup_cnt}대")
+        m2.metric("최대 중복 횟수", _dup_max)
+        m3.metric("평균 중복 횟수", f"{_dup_avg:.1f}")
         st.dataframe(format_dt_display(dup_display), use_container_width=True)
         date_tag = f"{start_date}_{end_date}"
         team_tag = "전체" if st.session_state.get('selected_team') in [None, "전체"] else st.session_state['selected_team']
@@ -368,6 +379,16 @@ def main():
         log_df['작성여부'] = (log_df['작성여부'] > 0).astype(int)
 
         st.markdown("## 📋 개인별 누락 현황")
+        # 📈 메트릭(누락 현황)
+        _ps_all = log_df.groupby(['팀', '작업자'])['작성여부'].agg(['mean','count']).reset_index()
+        _ps_all['누락일수'] = (1 - _ps_all['mean']) * _ps_all['count']
+        _miss_people = int((_ps_all['mean'] < 1.0).sum())
+        _total_miss_days = int(_ps_all['누락일수'].sum())
+        _overall_rate = int(((1 - log_df['작성여부'].mean()) * 100)) if len(log_df) else 0
+        n1, n2, n3 = st.columns(3)
+        n1.metric("누락 대상 인원", f"{_miss_people}명")
+        n2.metric("총 누락 일수", f"{_total_miss_days}일")
+        n3.metric("평균 누락률(전체)", f"{_overall_rate}%")
         personal_summary = log_df.groupby(['팀', '작업자'])['작성여부'].agg(['mean', 'count']).reset_index()
         personal_summary = personal_summary[personal_summary['mean'] < 1.0].copy()
         personal_summary['누락일수'] = (1 - personal_summary['mean']) * personal_summary['count']
@@ -415,7 +436,6 @@ def main():
             long_rows_display = long_rows.copy()
             if keep_sort:
                 long_rows_display = long_rows_display.sort_values('작업시간(분)', ascending=False)
-            long_rows_display['초과시간(분)'] = long_rows_display['작업시간(분)'] - error_threshold_min
             st.dataframe(format_dt_display(long_rows_display), use_container_width=True, height=420)
         with tab2:
             zero_rows_display = zero_rows.copy().sort_values(['팀','작업자','시작일시'])
@@ -584,6 +604,15 @@ def main():
 
         team_count = df['팀'].nunique()
         base_line = util_threshold / 100.0
+        # 📈 메트릭(가동률)
+        _util_avg = float(df_weekly['가동률(%)'].mean()) if not df_weekly.empty else 0.0
+        _team_avg = df_weekly.groupby('팀')['가동률(%)'].mean() if not df_weekly.empty else pd.Series(dtype=float)
+        _team_above = int((_team_avg >= base_line).sum()) if not df_weekly.empty else 0
+        _util_p90 = int(np.percentile(df_weekly['가동률(%)'] * 100, 90)) if not df_weekly.empty else 0
+        u1, u2, u3 = st.columns(3)
+        u1.metric("평균 가동률", f"{int(_util_avg*100)}%")
+        u2.metric("기준 이상 팀 수", f"{_team_above}/{team_count}")
+        u3.metric("가동률 P90", f"{_util_p90}%")
 
         fig_util = px.bar(
             df_weekly,
@@ -612,6 +641,14 @@ def main():
         daily_worker_count = capped.groupby(['작업일', '팀'])['작업자'].nunique().reset_index(name='작업자수')
         daily_avg = daily_sum.merge(daily_worker_count, on=['작업일', '팀'])
         daily_avg['평균작업시간(시간)'] = daily_avg['작업시간(분)'] / daily_avg['작업자수'] / 60
+        # 📈 메트릭(일별 평균 작업 시간)
+        _mean_hours = float(daily_avg['평균작업시간(시간)'].mean()) if not daily_avg.empty else 0.0
+        _exceed_cnt = int((daily_avg['평균작업시간(시간)'] >= daily_avg_threshold_hours).sum()) if not daily_avg.empty else 0
+        _max_hours = float(daily_avg['평균작업시간(시간)'].max()) if not daily_avg.empty else 0.0
+        d1, d2, d3 = st.columns(3)
+        d1.metric("평균(시간)", f"{_mean_hours:.1f}h")
+        d2.metric("기준 초과 건수", f"{_exceed_cnt}건")
+        d3.metric("최대 평균시간", f"{_max_hours:.1f}h")
 
         fig_daily = px.bar(
             daily_avg,
@@ -656,7 +693,17 @@ def main():
         crew_base['조구성'] = crew_base['원본작업자'].apply(lambda x: '2인 1조' if len(split_workers(x)) >= 2 else '1인 1조')
         crew_summary = crew_base.groupby(['팀', '조구성']).size().unstack(fill_value=0)
         crew_summary_percent = crew_summary.div(crew_summary.sum(axis=1), axis=0).fillna(0).round(4) * 100
-
+        # 📈 메트릭(팀별 운용조)
+        try:
+            _avg_one = float(crew_summary_percent['1인 1조'].mean()) if '1인 1조' in crew_summary_percent.columns else 0.0
+            _avg_two = float(crew_summary_percent['2인 1조'].mean()) if '2인 1조' in crew_summary_percent.columns else 0.0
+        except Exception:
+            _avg_one, _avg_two = 0.0, 0.0
+        _team_n = int(crew_summary_percent.shape[0])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("평균 1인 1조 비율", f"{_avg_one:.0f}%")
+        c2.metric("평균 2인 1조 비율", f"{_avg_two:.0f}%")
+        c3.metric("팀 수", f"{_team_n}팀")
         st.dataframe(
             crew_summary_percent.T.style.format("{:.2f}%"),
             use_container_width=True
@@ -694,7 +741,17 @@ def main():
         crew_task = df_taskcrew[['구분', '조구성']].copy()
         crew_task_grouped = crew_task.groupby(['구분', '조구성']).size().unstack(fill_value=0)
         crew_task_ratio = crew_task_grouped.div(crew_task_grouped.sum(axis=1), axis=0).fillna(0).round(4) * 100
-
+        # 📈 메트릭(업무구분별 인원조)
+        try:
+            _avg_two_task = float(crew_task_ratio['2인 1조'].mean()) if '2인 1조' in crew_task_ratio.columns else 0.0
+            _avg_one_task = float(crew_task_ratio['1인 1조'].mean()) if '1인 1조' in crew_task_ratio.columns else 0.0
+        except Exception:
+            _avg_two_task, _avg_one_task = 0.0, 0.0
+        _task_n = int(crew_task_ratio.shape[0])
+        t1, t2, t3 = st.columns(3)
+        t1.metric("평균 2인 1조 비율", f"{_avg_two_task:.0f}%")
+        t2.metric("평균 1인 1조 비율", f"{_avg_one_task:.0f}%")
+        t3.metric("업무 구분 수", f"{_task_n}")
         crew_task_reset = crew_task_ratio.reset_index().melt(id_vars='구분', var_name='조구성', value_name='비율')
         fig_crew_task = px.bar(
             crew_task_reset,
