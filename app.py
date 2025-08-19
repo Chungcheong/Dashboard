@@ -7,6 +7,158 @@ import re
 from io import BytesIO, StringIO
 import zipfile
 
+# =========================
+# PATCH PACK: 공통 설정·유틸 (자동삽입)
+# =========================
+import numpy as np
+import pandas as pd
+from io import BytesIO
+import zipfile
+
+# === 1) 설정 상수(단일 출처) ===
+BASIS_MIN_PER_DAY = 480               # 1일 기준 480분
+ABNORMAL_TASK_MIN = 600               # 단일 기록 10시간 초과는 분석에서 제외(진단용 컷)
+DEFAULT_ERROR_THRESHOLD_MIN = 480     # 작업시간 오류 임계(기본 8시간, 사이드바에서 변경)
+DISPLAY_DT_FMT = '%Y-%m-%d %H:%M'     # 표시용 날짜 포맷
+
+# === 2) 문자열 표준화 + 범주형 캐싱 ===
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in ['팀', '작업자', '구분', '장비ID', '장비명']:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+    if '구분' in df.columns:
+        df['구분'] = df['구분'].replace({
+            '장애/알람(AS)': '장애/알람',
+            '사무업무 ': '사무업무',
+        })
+    for col in ['시작일시','종료일시']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    for c in ['팀', '구분', '작업자']:
+        if c in df.columns:
+            df[c] = df[c].astype('category')
+    return df
+
+# === 3) 표시용 날짜 포맷 일원화 ===
+def format_dt_display(df: pd.DataFrame) -> pd.DataFrame:
+    disp = df.copy()
+    for col in ('시작일시','종료일시'):
+        if col in disp.columns:
+            disp[col] = pd.to_datetime(disp[col], errors='coerce').dt.strftime(DISPLAY_DT_FMT)
+    return disp
+
+# === 4) 겹침 병합(Union) — 안전 루프 버전 ===
+def merge_union_minutes(group: pd.DataFrame):
+    gg = group[['시작일시','종료일시']].copy()
+    gg['시작일시'] = pd.to_datetime(gg['시작일시'], errors='coerce')
+    gg['종료일시'] = pd.to_datetime(gg['종료일시'], errors='coerce')
+    gg = gg.dropna().sort_values('시작일시')
+    if gg.empty:
+        return pd.Series({'병합작업시간(분)': 0.0})
+    total = pd.Timedelta(0)
+    cur_s = gg.iloc[0]['시작일시']
+    cur_e = gg.iloc[0]['종료일시']
+    for _, row in gg.iloc[1:].iterrows():
+        s, e = row['시작일시'], row['종료일시']
+        if s <= cur_e:
+            if e > cur_e: cur_e = e
+        else:
+            total += (cur_e - cur_s)
+            cur_s, cur_e = s, e
+    total += (cur_e - cur_s)
+    return pd.Series({'병합작업시간(분)': total.total_seconds()/60})
+
+# === 4-ALT) 겹침 병합 — 벡터화(대용량 최적화) ===
+def merge_union_minutes_fast(group: pd.DataFrame):
+    gg = group[['시작일시','종료일시']].copy()
+    gg['시작일시'] = pd.to_datetime(gg['시작일시'], errors='coerce')
+    gg['종료일시'] = pd.to_datetime(gg['종료일시'], errors='coerce')
+    gg = gg.dropna().sort_values('시작일시')
+    if gg.empty:
+        return pd.Series({'병합작업시간(분)': 0.0})
+    s = gg['시작일시'].values.astype('datetime64[ns]').astype('int64')
+    e = gg['종료일시' ].values.astype('datetime64[ns]').astype('int64')
+    e_cummax = np.maximum.accumulate(e)
+    is_new = np.empty(len(s), dtype=bool)
+    is_new[0] = True
+    is_new[1:] = s[1:] > e_cummax[:-1]
+    grp = np.cumsum(is_new) - 1
+    minutes = (pd.Series(e).groupby(grp).max() - pd.Series(s).groupby(grp).min()).sum() / 1e9 / 60.0
+    return pd.Series({'병합작업시간(분)': float(minutes)})
+
+# === 5) 누락현황 기초(중간 산출물) — 캐시 ===
+try:
+    import streamlit as st
+except Exception:
+    class _Dummy: 
+        def __getattr__(self, k): 
+            def _f(*a, **kw): 
+                return None
+            return _f
+    st = _Dummy()
+
+@st.cache_data(show_spinner=False)
+def build_presence_table(df: pd.DataFrame) -> pd.DataFrame:
+    src = df.copy()
+    if '작업일' not in src.columns:
+        src['작업일'] = pd.to_datetime(src['시작일시'], errors='coerce').dt.date
+    workers = src[['팀','작업자']].dropna().drop_duplicates()
+    date_range = pd.date_range(start=pd.to_datetime(src['작업일']).min(),
+                               end  =pd.to_datetime(src['작업일']).max(),
+                               freq='B').date
+    idx = pd.MultiIndex.from_product([workers['작업자'], date_range], names=['작업자','작업일'])
+    all_rows = pd.DataFrame(index=idx).reset_index().merge(workers, on='작업자', how='left')
+    actual = src.groupby(['팀','작업자','작업일']).size().rename('작성여부').reset_index()
+    actual['작성여부'] = 1
+    pres = all_rows.merge(actual, on=['팀','작업자','작업일'], how='left').fillna({'작성여부':0})
+    return pres
+
+# === 6) 다운로드(엑셀 엔진 폴백 + 로깅) ===
+def df_to_download_bytes(df: pd.DataFrame, sheet_name: str = 'Sheet1'):
+    buf = BytesIO()
+    try:
+        with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+        buf.seek(0)
+        return buf.getvalue(), 'xlsxwriter'
+    except Exception as e1:
+        try:
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
+            buf.seek(0)
+            return buf.getvalue(), 'openpyxl'
+        except Exception as e2:
+            st.info(f"엑셀 엔진 사용 실패로 CSV(zip)으로 대체합니다. 원인: {type(e1).__name__} / {type(e2).__name__}")
+            zbuf = BytesIO()
+            with zipfile.ZipFile(zbuf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('data.csv', df.to_csv(index=False, encoding='utf-8-sig'))
+            zbuf.seek(0)
+            return zbuf.getvalue(), 'zip'
+
+# === 7) 사이드바·안내 배너(환경 의존 대안) ===
+def ensure_sidebar_and_captions():
+    try:
+        with st.sidebar:
+            st.markdown("### ⚙️ 분석 옵션")
+            if 'error_threshold_min' not in st.session_state:
+                st.session_state['error_threshold_min'] = DEFAULT_ERROR_THRESHOLD_MIN
+            new_v = st.number_input(
+                "작업시간 오류 임계값(분)",
+                min_value=60, max_value=1440,
+                value=int(st.session_state.get('error_threshold_min', DEFAULT_ERROR_THRESHOLD_MIN)), step=10,
+                help="품질 점검(오류 탐지)용 임계값입니다. 분석 제외 기준(10시간 컷)과 다릅니다."
+            )
+            st.session_state['error_threshold_min'] = int(new_v)
+        st.info("사이드바(▶)에서 기간/임계값을 조정하세요. 일부 환경에서는 업로드 후 자동으로 펼쳐지지 않을 수 있습니다.")
+        st.caption("※ 단일 기록 10시간(600분) 초과는 분석에서 제외(ABNORMAL_TASK_MIN). "
+                   "‘작업시간 오류 임계값’(기본 8시간)은 품질 점검용이며 사이드바에서 조정 가능합니다.")
+    except Exception:
+        pass
+
+# (자동 호출 시 메인 코드 위에 있어도 무해)
+# (패치) ensure_sidebar_and_captions()는 set_page_config 이후에 호출됩니다.
 # 공통 문자열 처리 유틸(중복 제거용)
 def sstr(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip()
@@ -14,6 +166,12 @@ def sstr(s: pd.Series) -> pd.Series:
 # ⚙️ Page config — MUST be the first Streamlit command
 st.set_page_config(page_title="업무일지 분석 대시보드", layout="wide", initial_sidebar_state="collapsed")
 
+
+# (패치) set_page_config 직후에 사이드바/캡션 표시
+try:
+    ensure_sidebar_and_captions()
+except Exception:
+    pass
 # ✅ Query params helpers (replace deprecated experimental_* with st.query_params)
 #    - 읽기: st.query_params.get("key", default)
 #    - 쓰기: st.query_params["key"] = "value"  (문자열)
@@ -735,10 +893,10 @@ def main():
         st.markdown("## 📉 팀 주차별 가동률")
 
         # 작업시간 기반(인원=전체, 누락률≥50% 제외)
-        BASIS_MIN_PER_DAY = 480  # 기준 근무시간(분/일)
+# (자동정리) 중복 정의 제거:         BASIS_MIN_PER_DAY = 480  # 기준 근무시간(분/일)
 
         # 1) 단일 기록 기준 '비정상적으로 긴 시간' 제외 — 한 작업당 10시간(600분) 초과 제외
-        ABNORMAL_TASK_MIN = 600  # 10시간(분)
+# (자동정리) 중복 정의 제거:         ABNORMAL_TASK_MIN = 600  # 10시간(분)
         util_df = df[(df['작업시간(분)'] >= 0) & (df['작업시간(분)'] < ABNORMAL_TASK_MIN)].copy()
 
         # 데이터 없으면 안내 후 섹션 종료
@@ -852,7 +1010,7 @@ def main():
         # 📊 일별 평균 작업 시간 — 10시간 초과 제외 + 같은 '업무(구분)' 내 겹침 병합 적용
         st.markdown("## 📊 일별 평균 작업 시간")
 
-        ABNORMAL_TASK_MIN = 600  # 한 작업당 10시간(분) 초과 제외
+# (자동정리) 중복 정의 제거:         ABNORMAL_TASK_MIN = 600  # 한 작업당 10시간(분) 초과 제외
         daily_src = df[(df['작업시간(분)'] >= 0) & (df['작업시간(분)'] < ABNORMAL_TASK_MIN)].copy()
 
         if daily_src.empty:
