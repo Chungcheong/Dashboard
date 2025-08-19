@@ -151,9 +151,8 @@ def ensure_sidebar_and_captions():
                 help="품질 점검(오류 탐지)용 임계값입니다. 분석 제외 기준(10시간 컷)과 다릅니다."
             )
             st.session_state['error_threshold_min'] = int(new_v)
-        st.info("사이드바(▶)에서 기간/임계값을 조정하세요. 일부 환경에서는 업로드 후 자동으로 펼쳐지지 않을 수 있습니다.")
-        st.caption("※ 단일 기록 10시간(600분) 초과는 분석에서 제외(ABNORMAL_TASK_MIN). "
-                   "‘작업시간 오류 임계값’(기본 8시간)은 품질 점검용이며 사이드바에서 조정 가능합니다.")
+        st.info("사이드바(▶)에서 기간/임계값을 조정하세요.")
+        st.caption("※ ‘작업시간 오류 임계값’(기본 8시간)은 품질 점검용이며 사이드바에서 조정 가능합니다.")
     except Exception:
         pass
 
@@ -329,7 +328,6 @@ def main():
 """, unsafe_allow_html=True)
 
     uploaded_file = st.file_uploader("📁 work_report.csv 파일 업로드", type=["csv"])
-    st.caption("필수 컬럼: 팀, 작업자, 시작일시, 종료일시, 업무종류, 구분, 장비ID, 장비명")
     st.markdown("""
 <div style='padding: 12px; background-color: #f0f8ff; border-left: 5px solid #0072C6; font-weight: bold; font-size: 16px;'>
 📤 MOStagram에서 업무일지 데이터 파일을 <b>다운로드한 후</b>, 해당 파일을 
