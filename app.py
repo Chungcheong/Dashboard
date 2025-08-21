@@ -151,8 +151,7 @@ def ensure_sidebar_and_captions():
                 help="품질 점검(오류 탐지)용 임계값입니다. 분석 제외 기준(10시간 컷)과 다릅니다."
             )
             st.session_state['error_threshold_min'] = int(new_v)
-        st.info("사이드바(▶)에서 기간/임계값을 조정하세요.")
-        st.caption("※ ‘작업시간 오류 임계값’(기본 8시간)은 품질 점검용이며 사이드바에서 조정 가능합니다.")
+        st.info("왼쪽 사이드바에서 기준/임계값 조정이 가능합니다.")
     except Exception:
         pass
 
@@ -337,7 +336,7 @@ def main():
 """, unsafe_allow_html=True)
 
     # 🧰 샘플 데이터 사용 (파일이 없을 때 UI 체험용)
-    with st.expander("🧰 샘플 데이터 사용", expanded=False):
+    with st.expander("🧰 샘플 데이터 사용 (파일이 없을 때 UI 체험용)", expanded=False):
         if st.button("샘플 CSV 불러오기"):
             sample = pd.DataFrame({
                 '팀': ['A','A','B','B'],
@@ -901,37 +900,34 @@ def main():
         if util_df.empty:
             st.info("가동률을 계산할 수 있는 데이터가 없습니다. (단일 기록 10시간 초과 제외 또는 필터로 인해 공집합)")
         else:
-            # (대체) 겹침 합집합 계산 함수: numpy.timedelta64 안전 처리
-            def _merge_union_minutes(g: pd.DataFrame) -> pd.Series:
-                gg = g.copy()
-                gg['시작일시'] = pd.to_datetime(gg['시작일시'], errors='coerce')
-                gg['종료일시'] = pd.to_datetime(gg['종료일시'], errors='coerce')
-                gg = gg.dropna(subset=['시작일시', '종료일시']).sort_values('시작일시')
+            # 1) 단일 기록 기준 '비정상적으로 긴 시간' 제외 — 한 작업당 10시간(600분) 초과 제외
+            # (주의) 아래 한 줄은 이미 전역에 ABNORMAL_TASK_MIN = 600이 정의되어 있으면 중복 정의하지 않습니다.
+            #         전역 정의가 없다면, 다음 줄을 활성화하세요(주석 해제).
+            # ABNORMAL_TASK_MIN = 600  # 10시간(분)
 
-                total = 0.0
-                cur_s, cur_e = None, None
-                for s, e in gg[['시작일시', '종료일시']].to_numpy():
-                    if cur_s is None:
-                        cur_s, cur_e = s, e
-                        continue
-                    if s <= cur_e:  # 겹침 → 구간 확장
-                        if e > cur_e:
-                            cur_e = e
-                    else:          # 불연속 → 누적 후 새 구간 시작
-                        total += float((cur_e - cur_s) / np.timedelta64(1, 'm'))
-                        cur_s, cur_e = s, e
-                if cur_s is not None:
-                    total += float((cur_e - cur_s) / np.timedelta64(1, 'm'))
+            util_df = df[(df['작업시간(분)'] >= 0) & (df['작업시간(분)'] < ABNORMAL_TASK_MIN)].copy()
 
-                return pd.Series({'병합작업시간(분)': total})
-
-            # 2) 같은 '업무(구분)' 내에서만 시간 겹침 병합 (작업자·작업일·구분·주차_표시 단위)
-            grp_keys = ['팀','작업자','구분','작업일','주차_표시']
+            # 2) 같은 '업무(구분)' 내에서만 시간 겹침 병합 — 완전 벡터화(대용량 최적화)
+            grp_keys = ['팀', '작업자', '구분', '작업일', '주차_표시']
+            tmp = (
+                util_df[grp_keys + ['시작일시', '종료일시']]
+                .dropna(subset=['시작일시', '종료일시'])
+                .sort_values(grp_keys + ['시작일시'])
+                .copy()
+            )
+            tmp['종료_cummax'] = tmp.groupby(grp_keys)['종료일시'].cummax()
+            prev_cummax = tmp.groupby(grp_keys)['종료_cummax'].shift()
+            tmp['새구간'] = prev_cummax.isna() | (tmp['시작일시'] > prev_cummax)
+            tmp['세그'] = tmp.groupby(grp_keys)['새구간'].cumsum()
+            segments = (
+                tmp.groupby(grp_keys + ['세그'])
+                   .agg(seg_start=('시작일시', 'min'), seg_end=('종료일시', 'max'))
+                   .reset_index()
+            )
+            segments['병합작업시간(분)'] = (segments['seg_end'] - segments['seg_start']).dt.total_seconds() / 60.0
             merged = (
-                util_df
-                .groupby(grp_keys, sort=False)           # dropna=False 호환성 이슈 방지
-                .apply(_merge_union_minutes)
-                .reset_index()
+                segments.groupby(grp_keys, as_index=False)['병합작업시간(분)']
+                        .sum()
             )
 
             # 3) 팀×주차별 주간 작업시간 합(분)
@@ -1016,39 +1012,33 @@ def main():
             daily_sum = pd.DataFrame(columns=['작업일', '팀', '작업시간(분)'])
             daily_worker_count = pd.DataFrame(columns=['작업일', '팀', '작업자수'])
         else:
-            # 겹침 합집합 계산(작업자·작업일·구분 단위) — numpy.timedelta64 안전 처리
-            def _merge_union_minutes_daily(g: pd.DataFrame) -> pd.Series:
-                gg = g.copy()
-                gg['시작일시'] = pd.to_datetime(gg['시작일시'], errors='coerce')
-                gg['종료일시'] = pd.to_datetime(gg['종료일시'], errors='coerce')
-                gg = gg.dropna(subset=['시작일시', '종료일시']).sort_values('시작일시')
-
-                total = 0.0
-                cur_s, cur_e = None, None
-                for s, e in gg[['시작일시', '종료일시']].to_numpy():
-                    if cur_s is None:
-                        cur_s, cur_e = s, e
-                        continue
-                    if s <= cur_e:  # 겹침 → 구간 확장
-                        if e > cur_e:
-                            cur_e = e
-                    else:           # 불연속 → 누적 후 새 구간 시작
-                        total += float((cur_e - cur_s) / np.timedelta64(1, 'm'))
-                        cur_s, cur_e = s, e
-                if cur_s is not None:
-                    total += float((cur_e - cur_s) / np.timedelta64(1, 'm'))
-
-                return pd.Series({'병합작업시간(분)': total})
-
-            # 같은 '업무(구분)' 내에서 겹침 병합
+            # 같은 '업무(구분)' 내에서 겹침 병합 — 완전 벡터화(대용량 최적화)
             gkeys = ['팀', '작업자', '구분', '작업일']
-            merged_daily = (
-                daily_src
-                .groupby(gkeys, sort=False)
-                .apply(_merge_union_minutes_daily)
-                .reset_index()
+            tmp = (
+                daily_src[gkeys + ['시작일시', '종료일시']]
+                .dropna(subset=['시작일시', '종료일시'])
+                .sort_values(gkeys + ['시작일시'])
+                .copy()
             )
-
+            # 그룹별 종료시각 누적최댓값과 이전 구간의 누적최댓값
+            tmp['종료_cummax'] = tmp.groupby(gkeys)['종료일시'].cummax()
+            prev_cummax = tmp.groupby(gkeys)['종료_cummax'].shift()
+            # 새 구간 시작 여부(이전 종료 누적최댓값보다 시작이 뒤면 새 구간)
+            tmp['새구간'] = prev_cummax.isna() | (tmp['시작일시'] > prev_cummax)
+            # 그룹 내 구간 번호
+            tmp['세그'] = tmp.groupby(gkeys)['새구간'].cumsum()
+            # 각 세그먼트의 [min 시작, max 종료]
+            segments = (
+                tmp.groupby(gkeys + ['세그'])
+                   .agg(seg_start=('시작일시', 'min'), seg_end=('종료일시', 'max'))
+                   .reset_index()
+            )
+            # 세그먼트 길이(분) 계산 후 그룹별 합
+            segments['병합작업시간(분)'] = (segments['seg_end'] - segments['seg_start']).dt.total_seconds() / 60.0
+            merged_daily = (
+                segments.groupby(gkeys, as_index=False)['병합작업시간(분)']
+                        .sum()
+            )
             # 팀별 일자 합계 (차트/표 입력용 DataFrame)
             daily_sum = (
                 merged_daily
